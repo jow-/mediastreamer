@@ -525,7 +525,7 @@ sub path_rel($$)
 	$path = Cwd::realpath($path);
 
 	if ($path eq $root) {
-		return '/';
+		return '';
 	}
 
 	if (length($path) < length($root) ||
@@ -534,7 +534,7 @@ sub path_rel($$)
 		return undef;
 	}
 
-	return substr($path, length($root));
+	return substr($path, length($root) + 1);
 }
 
 sub path_abs($$)
@@ -547,7 +547,7 @@ sub path_abs($$)
 
 	$path = Cwd::realpath("$root/$path");
 
-	if (path_rel($root, $path)) {
+	if (defined(path_rel($root, $path))) {
 		return $path;
 	}
 
@@ -578,52 +578,9 @@ sub url_dec($)
 	return $s;
 }
 
-sub handle_file($$)
+sub html_header()
 {
-	my ($client, $request) = @_;
-	my $path = path_abs($cache_dir, url_dec($request->uri->path));
-
-	if (defined($path) && -f $path) {
-		if ($path =~ m!/stream\.m3u8$! && $request->uri->query_param('seekable')) {
-			my $data = '';
-			if (open F, '<', $path) {
-				local $/;
-				$data = readline F;
-				$data =~ s!^#EXT-X-PLAYLIST-TYPE:EVENT\b!#EXT-X-PLAYLIST-TYPE:VOD!;
-				$data .= "\n#EXT-X-ENDLIST\n" unless $data =~ m!^#EXT-X-ENDLIST\b!;
-				close F;
-
-				warn "S: $path\n";
-				return $client->send_response(HTTP::Response->new(200, "OK", [
-					'Content-Type' => 'application/vnd.apple.mpegurl'
-				], $data));
-			}
-			else {
-				return $client->send_error(500, 'Unable to process playlist');
-			}
-		}
-
-		warn "F: $path\n";
-		return $client->send_file_response($path);
-	}
-
-	warn sprintf "404: %s (%s)\n", $path || '?', $request->uri->path;
-	return $client->send_error(404, 'No such file or directory');
-}
-
-sub handle_index($$)
-{
-	my ($client, $request) = @_;
-	my ($etag, @entries) = cache_etag();
-
-	my $dir = $request->uri->query_param('dir');
-	my $thumb = $request->uri->query_param('thumbnail');
-	my $movie = $request->uri->query_param('movie');
-	my $stream = $request->uri->query_param('stream');
-	my $delete = $request->uri->query_param('delete');
-	my $json = $movie ? json_read("$cache_dir/$movie/params.txt") : undef;
-
-	my $page = qq{
+	return q{
 		<html>
 			<head>
 				<title>iOS Streaming</title>
@@ -732,167 +689,245 @@ sub handle_index($$)
 			</head>
 			<body>
 	};
+}
 
-	if ($dir) {
-		my $path = path_abs($root_dir, $dir);
-		my $up   = path_rel($root_dir, path_abs($root_dir, "$dir/.."));
+sub html_footer()
+{
+	return q{
+			</body>
+		</html>
+	};
+}
 
+sub html_reply($$)
+{
+	my ($client, $body) = @_;
+	return $client->send_response(HTTP::Response->new(200, "OK", [
+		"Content-Type" => "text/html; charset=UTF-8"
+	], html_header() . ($body || '') . html_footer()));
+}
+
+
+sub handle_file($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($cache_dir, $file);
+
+	if (defined($path) && -f $path) {
+		warn "F: $path\n";
+		return $client->send_file_response($path);
+	}
+
+	warn sprintf "404: %s (%s)\n", $path || '?', $request->uri->path;
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_seekable($$$)
+{
+	my ($client, $request, $movie) = @_;
+	my $path = path_abs($cache_dir, "$movie/stream.m3u8");
+
+	if (open F, '<', $path) {
+		local $/;
+		my $data = readline F;
+		$data =~ s!^#EXT-X-PLAYLIST-TYPE:EVENT\b!#EXT-X-PLAYLIST-TYPE:VOD!;
+		$data .= "\n#EXT-X-ENDLIST\n" unless $data =~ m!^#EXT-X-ENDLIST\b!;
+		close F;
+
+		warn "S: $path\n";
+		return $client->send_response(HTTP::Response->new(200, "OK", [
+			'Content-Type' => 'application/vnd.apple.mpegurl'
+		], $data));
+	}
+
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_browse($$$)
+{
+	my ($client, $request, $dir) = @_;
+
+	my $path = path_abs($root_dir, $dir);
+	my $up   = path_rel($root_dir, path_abs($root_dir, "$dir/.."));
+
+	my $page = sprintf q{
+		<header>
+			<h1><a href="/">iOS Streaming</a></h1>
+			<span>%s</span>
+		</header>
+	}, path_rel($root_dir, $path);
+
+	if (opendir P, $path) {
+		if (defined($up)) {
+			$page .= sprintf q{
+				<li>
+					<a class="b" href="/browse/%s">../</a>
+			        <em class="i">parent</em>
+			    </li>
+			}, url_enc($up);
+		}
+
+		my (@dirs, @files);
+		while (defined(my $entry = readdir P)) {
+			my $file = "$path/$entry";
+
+			if (-d $file && $entry ne '.' && $entry ne '..') {
+				push @dirs, $entry;
+			}
+			elsif (-f $file && $entry =~ m!\.(mp4|mov|ogg|flv|wmv|avi)$!i) {
+				push @files, $entry;
+			}
+		}
+
+		closedir P;
+
+		foreach my $entry (sort @dirs) {
+			$page .= sprintf q{
+				<li>
+					<a class="b" href="/browse/%s">%s/</a>
+			        <em class="i">directory</em>
+			    </li>
+			}, url_enc(path_rel($root_dir, "$path/$entry")),
+			   html_esc($entry);
+		}
+
+		foreach my $entry (sort @files) {
+			my $file = path_rel($root_dir, "$path/$entry");
+
+			$page .= sprintf q{
+				<li>
+					<span class="t" style="background-image:url(/thumbnail/%s)">&nbsp;</span>
+			        <a class="b" href="/add/%s">%s</a>
+			        <span class="i">%.02f MB</span>
+			    </li>
+			}, url_enc($file),
+			   url_enc($file),
+			   html_esc($entry),
+			   (stat "$path/$entry")[7] / 1024 / 1024;
+		}
+	}
+
+	$page .= q{
+		</ul>
+		<nav>
+	};
+
+	if (defined($up)) {
 		$page .= sprintf q{
+			<a class="i" href="/browse/%s">&laquo; Parent directory</a>
+		}, url_enc($up);
+	}
+
+	$page .= q{
+			<a class="r" href="/">Overview &raquo;</a>
+		</nav>
+	};
+
+	return html_reply($client, $page);
+}
+
+sub handle_thumbnail($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($root_dir, $file);
+	if ($path) {
+		my $data = vlc_thumbnail($client, $path);
+		if ($data) {
+			return $client->send_response(HTTP::Response->new(200, "OK", [
+				'Content-Type'  => 'image/png',
+				'Expires'       => POSIX::strftime('%a, %e %b %Y %H:%M:%S %Z', localtime(time() + 30758400)),
+				'Cache-Control' => 'max-age=30758400'
+			], $data));
+		}
+	}
+
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_add($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($root_dir, $file);
+	if ($path) {
+		my ($filename, $basename) = $path =~ m!/(([^/]+?)\.[^./]+)$!;
+		my ($ok, $error) = vlc_transcode($client, {
+			type      => "file",
+			name      => $filename,
+			file      => $path,
+			date      => POSIX::strftime("%Y-%m-%d %H:%M:%S %z", localtime),
+
+			clientid  => "htmlview",
+			good      => "HLS",
+			set       => "HLS",
+
+			keyframe  => "90",
+			width     => "960",
+			vb        => "1800",
+			ab        => "128",
+		});
+
+		if ($ok) {
+			for (my $i = 0; $i < 10; $i++) {
+				my (undef, $segments) = encoding_status($basename);
+				if ($segments > 2) {
+					return $client->send_redirect(
+						sprintf 'http://%s/movie/%s',
+							$request->header('Host'),
+							url_enc($basename));
+				}
+				sleep(1);
+			}
+
+			return $client->send_redirect(
+				sprintf 'http://%s/', $request->header('Host'));
+		}
+
+		return html_reply($client, sprintf q{
 			<header>
 				<h1><a href="/">iOS Streaming</a></h1>
 				<span>%s</span>
 			</header>
-		}, path_rel($root_dir, $path);
-
-		if (opendir P, $path) {
-			if ($up) {
-				$page .= sprintf q{
-					<li>
-						<a class="b" href="/?dir=%s">../</a>
-				        <em class="i">parent</em>
-				    </li>
-				}, url_enc($up);
-			}
-
-			my (@dirs, @files);
-			while (defined(my $entry = readdir P)) {
-				my $file = "$path/$entry";
-
-				if (-d $file && $entry ne '.' && $entry ne '..') {
-					push @dirs, $entry;
-				}
-				elsif (-f $file && $entry =~ m!\.(mp4|mov|ogg|flv|wmv|avi)$!i) {
-					push @files, $entry;
-				}
-			}
-
-			closedir P;
-
-			foreach my $entry (sort @dirs) {
-				$page .= sprintf q{
-					<li>
-						<a class="b" href="/?dir=%s">%s/</a>
-				        <em class="i">directory</em>
-				    </li>
-				}, url_enc(path_rel($root_dir, "$path/$entry")),
-				   html_esc($entry);
-			}
-
-			foreach my $entry (sort @files) {
-				my $file = path_rel($root_dir, "$path/$entry");
-
-				$page .= sprintf q{
-					<li>
-						<span class="t" style="background-image:url(/?thumbnail=%s)">&nbsp;</span>
-				        <a class="b" href="/?stream=%s">%s</a>
-				        <span class="i">%.02f MB</span>
-				    </li>
-				}, url_enc($file),
-				   url_enc($file),
-				   html_esc($entry),
-				   (stat "$path/$entry")[7] / 1024 / 1024;
-			}
-		}
-
-		$page .= '</ul><nav>';
-
-		if ($up) {
-			$page .= sprintf q{
-				<a class="i" href="/?dir=%s">&laquo; Parent directory</a>
-			}, url_enc($up);
-		}
-
-		$page .= '<a class="r" href="/">Overview &raquo;</a></nav>';
+			<p>
+				An error occured while transcoding:
+				<em>%s</em>
+			</p>
+			<nav>
+				<a class="i" href="/">&laquo; Overview</a>
+			</nav>
+		}, html_esc($basename),
+		   html_esc($error));
 	}
-	elsif ($thumb) {
-		my $path = path_abs($root_dir, $thumb);
-		if ($path) {
-			my $data = vlc_thumbnail($client, $path);
-			if ($data) {
-				return $client->send_response(HTTP::Response->new(200, "OK", [
-					'Content-Type'  => 'image/png',
-					'Expires'       => POSIX::strftime('%a, %e %b %Y %H:%M:%S %Z', localtime(time() + 30758400)),
-					'Cache-Control' => 'max-age=30758400'
-				], $data));
-			}
-		}
 
-		return $client->send_error(404, 'No such file or directory');
-	}
-	elsif ($stream) {
-		my $path = path_abs($root_dir, $stream);
-		if ($path) {
-			my ($filename, $basename) = $path =~ m!/(([^/]+?)\.[^./]+)$!;
-			my ($ok, $error) = vlc_transcode($client, {
-				type      => "file",
-				name      => $filename,
-				file      => $path,
-				date      => POSIX::strftime("%Y-%m-%d %H:%M:%S %z", localtime),
+	return html_reply($client, sprintf q{
+		<header>
+			<h1><a href="/">iOS Streaming</a></h1>
+			<span>%s</span>
+		</header>
+		<p>
+			Invalid path requested for transcoding
+		</p>
+		<nav>
+			<a class="i" href="/">&laquo; Overview</a>
+		</nav>
+	}, html_esc($file));
+}
 
-				clientid  => "htmlview",
-				good      => "HLS",
-				set       => "HLS",
+sub handle_delete($$$)
+{
+	my ($client, $request, $movie) = @_;
+	my ($ok, $error) = delete_cache($client, $movie);
 
-				keyframe  => "90",
-				width     => "960",
-				vb        => "1800",
-				ab        => "128",
-			});
+	return $client->send_redirect(
+		sprintf 'http://%s/', $request->header('Host'));
+}
 
-			if ($ok) {
-				for (my $i = 0; $i < 10; $i++) {
-					my (undef, $segments) = encoding_status($basename);
-					if ($segments > 2) {
-						return $client->send_redirect(
-							sprintf 'http://%s/?movie=%s', $request->header('Host'), $basename);
-					}
-					sleep(1);
-				}
-
-				return $client->send_redirect(
-					sprintf 'http://%s/', $request->header('Host'));
-			}
-			else {
-				$page .= sprintf q{
-					<header>
-						<h1><a href="/">iOS Streaming</a></h1>
-						<span>%s</span>
-					</header>
-					<p>
-						An error occured while transcoding:
-						<em>%s</em>
-					</p>
-					<nav>
-						<a class="i" href="/">&laquo; Overview</a>
-					</nav>
-				}, html_esc($basename),
-				   html_esc($error);
-			}
-		}
-		else
-		{
-			$page .= sprintf q{
-				<header>
-					<h1><a href="/">iOS Streaming</a></h1>
-					<span>%s</span>
-				</header>
-				<p>
-					Invalid path requested for transcoding
-				</p>
-				<nav>
-					<a class="i" href="/">&laquo; Overview</a>
-				</nav>
-			}, html_esc($stream);
-		}
-	}
-	elsif ($delete) {
-		my ($ok, $error) = delete_cache($client, $delete);
-
-		return $client->send_redirect(
-			sprintf 'http://%s/', $request->header('Host'));
-	}
-	elsif ($json) {
-		$page .= sprintf q{
+sub handle_movie($$$)
+{
+	my ($client, $request, $movie) = @_;
+	my $file = path_abs($cache_dir, "$movie/params.txt");
+	my $json = $file ? json_read($file) : undef;
+	if ($json) {
+		return html_reply($client, sprintf q{
 			<script type="text/javascript">
 				var old_pos = NaN;
 
@@ -912,7 +947,7 @@ sub handle_index($$)
 
 				function toggleSeekable(btn) {
 					var v = document.getElementsByTagName('video')[0];
-					var s = /\?seekable=1$/.test(v.src);
+					var s = v.src.indexOf('/seekable.m3u8') > 0;
 
 					old_pos = v.currentTime;
 					v.addEventListener('canplaythrough', startPlay, false);
@@ -920,11 +955,11 @@ sub handle_index($$)
 					if (s) {
 						btn.className = 'r';
 						btn.nextElementSibling.style.display = 'none';
-						v.src = v.src.replace(/\?seekable=1$/, '');
+						v.src = decodeURIComponent('/%s/stream.m3u8');
 					} else {
 						btn.className = 'g';
 						btn.nextElementSibling.style.display = '';
-						v.src += '?seekable=1';
+						v.src = decodeURIComponent('/%s/seekable.m3u8');
 					}
 				}
 
@@ -973,63 +1008,67 @@ sub handle_index($$)
 				document.getElementsByTagName('video')[0].addEventListener('progress', updateStatus, false);
 				document.getElementsByTagName('video')[0].addEventListener('canplaythrough', updateStatus, false);
 			</script>
-		}, html_esc($movie),
-		   url_enc($movie);
-	}
-	else {
-		$page .= q{
-			<header>
-				<h1>iOS Streaming</h1>
-			</header>
-			<ul>
-		};
-
-		foreach my $entry (@entries) {
-			my $params = "$cache_dir/$entry/params.txt";
-			next unless -f $params;
-
-			my $info = json_read($params);
-			next unless $info;
-
-			my ($status, $segments) = encoding_status($entry);
-			my $duration = $segments * ($info->{seglen} || 10);
-
-			my $link = path_rel($root_dir, $info->{file});
-
-			$page .= sprintf q{
-				<li>
-					<span class="t" style="background-image:url(/?thumbnail=%s)">&nbsp;</span>
-					<a class="b" href="/?movie=%s">
-						<strong>%s</strong><br>
-						%s: %02d:%02d:%02d
-					</a>
-					<a class="r" href="/?delete=%s">Delete</a>
-				</li>
-			}, url_enc($link),
-			   url_enc($entry),
-			   html_esc($entry),
-			   ($status eq 'complete') ? 'Ready' : 'Transcoding',
-			   $duration / 3600, $duration % 3600 / 60, $duration % 60,
-			   url_enc($info->{serverid} || '');
-		}
-
-		$page .= q{
-			</ul>
-			<nav>
-				<a class="i" href="/?dir=/">Add movies &raquo;</a>
-			</nav>
-			<meta http-equiv="refresh" content="10">
-		};
+		}, url_enc($movie),
+		   url_enc($movie),
+		   html_esc($movie),
+		   url_enc($movie));
 	}
 
-	$page .= '</body></html>';
+	return $client->send_redirect(
+		sprintf 'http://%s/', $request->header('Host'));
+}
 
-	my $response = HTTP::Response->new(200, "OK", [
-		"Content-Type" => "text/html; charset=UTF-8",
-		"ETag"         => $json ? $json->{serverid} : $etag
-	], $page);
+sub handle_index($$)
+{
+	my ($client, $request) = @_;
+	my ($etag, @entries) = cache_etag();
 
-	return $client->send_response($response);
+
+	my $page = q{
+		<header>
+			<h1>iOS Streaming</h1>
+		</header>
+		<ul>
+	};
+
+	foreach my $entry (@entries) {
+		my $params = "$cache_dir/$entry/params.txt";
+		next unless -f $params;
+
+		my $info = json_read($params);
+		next unless $info;
+
+		my ($status, $segments) = encoding_status($entry);
+		my $duration = $segments * ($info->{seglen} || 10);
+
+		my $link = path_rel($root_dir, $info->{file});
+
+		$page .= sprintf q{
+			<li>
+				<span class="t" style="background-image:url(/thumbnail/%s)">&nbsp;</span>
+				<a class="b" href="/movie/%s">
+					<strong>%s</strong><br>
+					%s: %02d:%02d:%02d
+				</a>
+				<a class="r" href="/delete/%s">Delete</a>
+			</li>
+		}, url_enc($link),
+		   url_enc($entry),
+		   html_esc($entry),
+		   ($status eq 'complete') ? 'Ready' : 'Transcoding',
+		   $duration / 3600, $duration % 3600 / 60, $duration % 60,
+		   url_enc($info->{serverid} || '');
+	}
+
+	$page .= q{
+		</ul>
+		<nav>
+			<a class="i" href="/browse/">Add movies &raquo;</a>
+		</nav>
+		<meta http-equiv="refresh" content="10">
+	};
+
+	return html_reply($client, $page);
 }
 
 
@@ -1038,11 +1077,29 @@ sub handle_client($)
 	my ($client) = @_;
 
 	while (my $request = $client->get_request) {
-		if ($request->uri->path eq '/') {
-			handle_index($client, $request);
-		}
-		else {
-			handle_file($client, $request);
+		for (url_dec($request->uri->path)) {
+			m!^/browse/(.*)$! &&
+				return handle_browse($client, $request, $1 || '/');
+
+			m!^/thumbnail/(.+)$! &&
+				return handle_thumbnail($client, $request, $1);
+
+			m!^/movie/(.+)$! &&
+				return handle_movie($client, $request, $1);
+
+			m!^/add/(.+)$! &&
+				return handle_add($client, $request, $1);
+
+			m!^/delete/(.+)$! &&
+				return handle_delete($client, $request, $1);
+
+			m!^/([^/]+)/seekable\.m3u8$! &&
+				return handle_seekable($client, $request, $1);
+
+			m!^/$! &&
+				return handle_index($client, $request);
+
+			return handle_file($client, $request, $_);
 		}
 	}
 }
