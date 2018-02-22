@@ -84,24 +84,6 @@ sub json_read($)
 	return 0;
 }
 
-sub reply_json($$;$)
-{
-	my ($client, $object, $header) = @_;
-
-	if (!defined($header) || ref($header) ne 'ARRAY') {
-		$header = [
-			'Content-Type' => 'application/json; charset=UTF-8'
-		];
-	}
-
-	my $response = HTTP::Response->new(200, "OK", $header,
-	                                   JSON->new->utf8->encode($object));
-
-	warn sprintf "R: %s\n", $response->content;
-
-	return $client->send_response($response);
-}
-
 sub exec_cmd
 {
 	my ($client, @cmd) = @_;
@@ -596,147 +578,6 @@ sub url_dec($)
 	return $s;
 }
 
-sub handle_movies($$)
-{
-	my ($client, $request) = @_;
-	my ($cache_etag, @entries) = cache_etag();
-	my $client_etag = $request->header('If-None-Match');
-
-	if (defined($client_etag) && $client_etag eq $cache_etag) {
-		return $client->send_response(HTTP::Response->new(304, "No changes", [
-			'Content-Type' => 'application/json; charset=UTF-8',
-			'ETag'         => $cache_etag
-		]));
-	}
-
-	my @movies;
-
-	foreach my $entry (@entries) {
-		my $params = "$cache_dir/$entry/params.txt";
-		next unless -f "$cache_dir/$entry/params.txt";
-
-		my $json = json_read($params);
-		next unless ref($json) eq 'HASH' && $json->{name} && $json->{type} eq 'file';
-
-		push @movies, {
-			name => $entry,
-			params => $json,
-			status => encoding_status($entry),
-			serverId => $json->{serverid},
-			displayedName => $json->{name}
-		};
-	}
-
-	return reply_json($client, { movies => \@movies }, [
-		'Content-Type' => 'application/json; charset=UTF-8',
-		'ETag'         => $cache_etag
-	]);
-}
-
-sub handle_browse($$)
-{
-	my ($client, $request) = @_;
-	my $dir = $request->uri->query_param('dir');
-	my @entries;
-
-	if (opendir D, $dir) {
-		while (defined(my $entry = readdir D)) {
-			next if $entry eq '.' || $entry eq '..';
-
-			my $path = Cwd::realpath("$dir/$entry");
-
-			if (-d $path) {
-				push @entries, {
-					type => "dir",
-					name => $entry,
-					path => $path
-				};
-			}
-			elsif (-f $path) {
-				push @entries, {
-					type => "file",
-					name => $entry,
-					path => $path
-				};
-			}
-		}
-
-		closedir D;
-	}
-
-	return reply_json($client, {
-		files => \@entries,
-		root  => Cwd::realpath($dir)
-	});
-}
-
-sub handle_getpath($$)
-{
-	my ($client, $request) = @_;
-	my $dir = $request->uri->query_param('dir');
-
-	if ($dir eq '...home...') {
-		return reply_json($client, { root => $root_dir });
-	}
-	elsif ($dir eq '...drives...') {
-		return reply_json($client, { root => "/" });
-	}
-	else {
-		warn "Unknown path type: " . $dir . "\n";
-		return reply_json($client, {
-			errorMessage => "Unknown directory type '$dir'",
-			result => ""
-		});
-	}
-}
-
-sub handle_info($$)
-{
-	my ($client, $request) = @_;
-	my $file = $request->uri->query_param('file');
-	my $info = vlc_info($client, $file);
-	return reply_json($client, $info);
-}
-
-sub handle_create2($$)
-{
-	my ($client, $request) = @_;
-	my ($ok, $error) = vlc_transcode($client, {
-		keyframe  => $request->uri->query_param('keyframe'),
-		file      => $request->uri->query_param('file'),
-		width     => $request->uri->query_param('width'),
-		clientid  => $request->uri->query_param('clientid'),
-		type      => $request->uri->query_param('type'),
-		good      => $request->uri->query_param('good'),
-		date      => $request->uri->query_param('date'),
-		set       => $request->uri->query_param('set'),
-		ab        => $request->uri->query_param('ab'),
-		vb        => $request->uri->query_param('vb'),
-		name      => $request->uri->query_param('name'),
-		framerate => $request->uri->query_param('framerate'),
-	});
-
-	if ($ok) {
-		return reply_json($client, { errorMessage => "", result => "encoding started" });
-	}
-	else {
-		return reply_json($client, { errorMessage => $error, result => "" });
-	}
-}
-
-sub handle_delete($$)
-{
-	my ($client, $request) = @_;
-	my ($ok, $error) = delete_cache($client, $request->uri->query_param('id'));
-
-	if ($ok) {
-		return reply_json($client, { errorMessage => "", result => "movie deleted" });
-	}
-	else {
-		return reply_json($client, { errorMessage => $error, result => "" });
-	}
-}
-
 sub handle_file($$)
 {
 	my ($client, $request) = @_;
@@ -1197,32 +1038,7 @@ sub handle_client($)
 	my ($client) = @_;
 
 	while (my $request = $client->get_request) {
-		if ($request->uri->path eq '/secure') {
-			my $command = $request->uri->query_param('command');
-			if ($command eq 'movies') {
-				handle_movies($client, $request);
-			}
-			elsif ($command eq 'browse') {
-				handle_browse($client, $request);
-			}
-			elsif ($command eq 'getpath')
-			{
-				handle_getpath($client, $request);
-			}
-			elsif ($command eq 'info')
-			{
-				handle_info($client, $request);
-			}
-			elsif ($command eq 'create2')
-			{
-				handle_create2($client, $request);
-			}
-			elsif ($command eq 'delete')
-			{
-				handle_delete($client, $request);
-			}
-		}
-		elsif ($request->uri->path eq '/') {
+		if ($request->uri->path eq '/') {
 			handle_index($client, $request);
 		}
 		else {
