@@ -28,13 +28,13 @@ use POSIX ':sys_wait_h';
 
 my $local_port = $ARGV[0] || 51544;
 my $root_dir = Cwd::realpath($ARGV[1] || $ENV{HOME} . '/Downloads');
-my $cache_dir = "/tmp/.streamer_cache";
+my $cache_dir = Cwd::realpath($ARGV[2] || '/tmp/.streamer_cache');
 my $vlc_exe = "/usr/bin/vlc";
 
 $SIG{'PIPE'} = 'IGNORE';
 
 if (defined($ARGV[0]) && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
-	die "Usage: $0 [listen-port] [media-directory]\n";
+	die "Usage: $0 [listen-port] [media-directory] [cache-directory]\n";
 }
 
 my $daemon = HTTP::Daemon->new(
