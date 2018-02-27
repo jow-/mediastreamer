@@ -1,0 +1,1283 @@
+#!/usr/bin/env perl
+#
+# Copyright 2018 Jo-Philipp Wich <jo@mein.io>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+use strict;
+use warnings;
+
+use Cwd;
+use Fcntl;
+use JSON;
+use IO::Select;
+use Digest::MD5;
+use HTTP::Daemon;
+use URI::QueryParam;
+use LWP::MediaTypes;
+use File::Temp;
+use POSIX ':sys_wait_h';
+
+my $local_port = $ARGV[0] || 51544;
+my $root_dir = Cwd::realpath($ARGV[1] || $ENV{HOME} . '/Downloads');
+my $cache_dir = Cwd::realpath($ARGV[2] || '/tmp/.streamer_cache');
+my $vlc_exe = "/usr/bin/vlc";
+
+$SIG{'PIPE'} = 'IGNORE';
+
+if (defined($ARGV[0]) && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
+	die "Usage: $0 [listen-port] [media-directory] [cache-directory]\n";
+}
+
+my $daemon = HTTP::Daemon->new(
+	LocalPort => $local_port,
+	LocalAddr => '0.0.0.0',
+	ReuseAddr => 1,
+	Listen    => 30
+) || die "Unable to instantiate daemon: $!\n";
+
+sub json_write($$)
+{
+	my ($path, $object) = @_;
+
+	if (open J, '>', $path) {
+		print J JSON->new->utf8->encode($object);
+		close J;
+
+		return 1;
+	}
+
+	warn "Unable to write file $path: $!\n";
+	return 0;
+}
+
+sub json_read($)
+{
+	my ($path) = @_;
+
+	if (open J, '<', $path) {
+		local $/;
+		my $object;
+
+		eval {
+			$object = JSON->new->utf8->decode(readline J);
+		};
+
+		if ($@) {
+			warn "Unable to decode JSON: $@\n";
+		}
+
+		close J;
+
+		return $object;
+	}
+
+	warn "Unable to read file $path: $!\n";
+	return 0;
+}
+
+sub exec_cmd
+{
+	my ($client, @cmd) = @_;
+	my ($out, $pid, $ro, $re, $wo, $we);
+
+	warn "X: @cmd\n";
+
+	if (!pipe($ro, $wo)) {
+		warn "Unable to spawn pipe: $!\n";
+		return ();
+	}
+
+	if (!pipe($re, $we)) {
+		warn "Unable to spawn pipe: $!\n";
+		close($ro);
+		close($wo);
+		return ();
+	}
+
+	$pid = fork;
+
+	if (!defined $pid) {
+		warn "Unable to fork child: $!\n";
+		close($ro);
+		close($wo);
+		close($re);
+		close($we);
+		return ();
+	}
+
+	if ($pid == 0) {
+		close($daemon);
+		close($client);
+		open(STDOUT, ">&", $wo);
+		open(STDERR, ">&", $we);
+		close(STDIN);
+		close($ro);
+		close($wo);
+		close($re);
+		close($we);
+		exec(@cmd);
+		exit -1;
+	}
+
+	close($wo);
+	close($we);
+
+	my $s = IO::Select->new($ro, $re);
+
+	while (1) {
+		my @fds = $s->can_read(10);
+
+		if (!@fds) {
+			warn "Command timed out\n" if $s->count > 0;
+			kill $pid;
+			last;
+		}
+
+		foreach my $fd (@fds) {
+			my ($len, $buf);
+
+			$len = $fd->sysread($buf, 1024);
+
+			if ($len <= 0) {
+				$s->remove($fd);
+			}
+			else {
+				$out = '' unless defined $out;
+				$out .= $buf;
+			}
+		}
+	}
+
+	waitpid($pid, 0);
+
+	close($ro);
+	close($re);
+
+	return split /\r?\n/, $out;
+}
+
+sub vlc_transcode($$)
+{
+	my ($client, $params) = @_;
+
+	my $keyframe  = $params->{keyframe}  || '';
+	my $file      = $params->{file}      || '';
+	my $width     = $params->{width}     || '';
+	my $clientid  = $params->{clientid}  || '';
+	my $type      = $params->{type}      || '';
+	my $good      = $params->{good}      || '';
+	my $date      = $params->{date}      || '';
+	my $set       = $params->{set}       || '';
+	my $ab        = $params->{ab}        || '';
+	my $vb        = $params->{vb}        || '';
+	my $name      = $params->{name}      || '';
+	my $framerate = $params->{framerate} || '';
+
+	my $info = undef;
+
+	unless ($type      eq 'file' &&
+	        $file      =~ m!^.+$! && -f $file &&
+	        $date      =~ m!^\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d\d\d\d$! &&
+	        length($name) && length($good) && length($set) && length($clientid) &&
+	        $ab        =~ m!^\d+$! && $ab > 0 &&
+	        $vb        =~ m!^\d+$! && $vb > 0 &&
+	        $width     =~ m!^\d+$! && $width > 0 &&
+	        $keyframe  =~ m!^\d+$! && $keyframe > 0)
+	{
+		return (undef, "Invalid parameters given");
+	}
+
+	my ($basename) = $file =~ m!/([^/]+?)\.[^.]+$!;
+	my $serverid = Digest::MD5::md5_hex(path_rel($root_dir, $file) || $file);
+	my $workdir = sprintf '%s/%s', $cache_dir, $serverid;
+
+	unless (-f "$workdir/params.txt") {
+		if (system('mkdir', '-p', $workdir) != 0) {
+			return (undef, "Unable to mkdir: $!");
+		}
+		else {
+			$workdir = Cwd::realpath($workdir);
+		}
+
+		my $seglen = 10;
+		my $senc = 'Windows-1252';
+		my $sout;
+
+		my $meta = vlc_info($client, $file);
+		if ($meta->{'tracks-video'} && @{$meta->{'tracks-video'}} > 0) {
+			$sout =
+				'--sout=#transcode{' .
+					'vcodec=h264,soverlay,acodec=aac,channels=2,venc=x264{' .
+						'hrd=vbr,profile=baseline,level=3,preset=fast,' .
+						"keyint=$keyframe," .
+						'ref=1,' .
+						"vbv-maxrate=$vb,vbv-bufsize=$vb" .
+					'},' .
+					"width=$width," .
+					'deinterlace,' .
+					"ab=$ab" .
+				'}:std{' .
+					'access=livehttp{' .
+						"seglen=$seglen," .
+						"index=\"$workdir/stream.m3u8\"," .
+						'index-url=stream-###.ts' .
+					'},' .
+					'mux=ts{use-key-frames},' .
+					"dst=\"$workdir/stream-###.ts\"" .
+				'}'
+			;
+		}
+		else {
+			$sout =
+				'--sout=#transcode{' .
+					'vcodec=none,acodec=aac,channels=2,' .
+					"ab=$ab" .
+				'}:std{' .
+					'access=livehttp{' .
+						"seglen=$seglen," .
+						'splitanywhere=true,' .
+						"index=\"$workdir/stream.m3u8\"," .
+						'index-url=stream-###.ts' .
+					'},' .
+					'mux=ts,' .
+					"dst=\"$workdir/stream-###.ts\"" .
+				'}'
+			;
+		}
+
+		my @cmd = ($vlc_exe,
+			qw(--ignore-config -I dummy --no-sout-all),
+			$file, 'vlc://quit', $sout,
+			"--subsdec-encoding=$senc",
+			qw(--sout-avcodec-strict=-2 -vvv --extraintf=logger --file-logging),
+			"--logfile=$workdir/encode.log");
+
+		warn "X: @cmd\n";
+
+		my $pid = fork;
+
+		if (!defined $pid) {
+			return (undef, "Unable to fork: $!");
+		}
+
+		if ($pid == 0) {
+			$daemon->close;
+			$client->close;
+
+			POSIX::setsid();
+
+			my $vlcpid = fork;
+
+			if (!defined $vlcpid) {
+				exit -1;
+			}
+
+			if ($vlcpid == 0) {
+				open(STDOUT, '>', '/dev/null');
+				open(STDERR, '>', '/dev/null');
+				close(STDIN);
+				exec(@cmd);
+				exit(-1);
+			}
+
+			open(P, '>', "$workdir/encode.pid");
+			print P $vlcpid;
+			close P;
+
+			waitpid $vlcpid, 0;
+
+			if ($? == 0) {
+				open(C, '>', "$workdir/complete.txt");
+				close(C);
+				unlink("$workdir/encode.pid");
+			}
+
+			exit $?;
+		}
+
+		$info = {
+			command              => "create2",
+			usehelpersettings    => "1",
+			'--subsdec-encoding' => $senc,
+			sout                 => $sout,
+			seglen               => $seglen,
+
+			date      => $date,
+			type      => $type,
+			name      => $basename,
+			file      => $file,
+			link      => path_rel($root_dir, $file),
+
+			clientid  => $clientid,
+			serverid  => $serverid,
+			processid => $pid,
+
+			good      => $good,
+			set       => $set,
+
+			ab        => $ab,
+			vb        => $vb,
+			width     => $width,
+			keyframe  => $keyframe,
+			framerate => $framerate,
+
+			meta      => $meta
+		};
+
+		json_write("$workdir/params.txt", $info);
+	}
+	else {
+		$info = json_read("$workdir/params.txt");
+	}
+
+	return ($info, "encoding started");
+}
+
+sub vlc_thumbnail($$)
+{
+	my ($client, $file) = @_;
+	my $cache = sprintf '%s/thumbs/%s.png',
+		$cache_dir, Digest::MD5::md5_hex(path_rel($root_dir, $file) || $file);
+
+	if (system('mkdir', '-p', "$cache_dir/thumbs") != 0) {
+		warn "Unable to create thumbnail directory: $!\n";
+		return undef;
+	}
+
+	if (open C, '<', $cache) {
+		local $/;
+		my $data = readline C;
+		close C;
+		return $data;
+	}
+
+	my $info = vlc_info($client, $file) || {};
+	(my $dur = $info->{duration} || '') =~ s![^0-9].*$!.0!;
+	my $pos = ($dur < 121) ? int($dur * 0.25) : 121;
+
+	my $dir = File::Temp->newdir;
+	my @cmd = ($vlc_exe,
+		qw(--ignore-config -I dummy -V dummy -A dummy
+		   --no-video-title --no-media-library --avcodec-hw=off
+		   --rate=1 --video-filter=scene --scene-format=png --scene-ratio=24),
+		"--start-time=$pos", "--stop-time=".($pos+1),
+		"--scene-path=$dir", $file, 'vlc://quit');
+
+	exec_cmd($client, @cmd);
+
+	my $snap;
+
+	if (opendir D, $dir) {
+		while (defined(my $entry = readdir D)) {
+			my $file = "$dir/$entry";
+			next unless -f $file;
+			$snap = $file if !defined($snap) || $file gt $snap;
+		}
+		closedir D;
+	}
+
+	my $data;
+
+	if ($snap) {
+		if (open S, '<', $snap) {
+			binmode S;
+			local $/;
+			$data = readline S;
+			close S;
+		}
+	}
+	else {
+		warn "Unable to generate snapshot of '$file'\n";
+
+		if ($info->{'tracks-video'} && @{$info->{'tracks-video'}} > 0) {
+			$data = data_resource('video.png');
+		}
+		else {
+			$data = data_resource('audio.png');
+		}
+	}
+
+	if ($data && open C, '>', $cache) {
+		binmode C;
+		print C $data;
+		close C;
+	}
+
+	return $data;
+}
+
+sub vlc_info($$;$)
+{
+	my ($client, $file, $field) = @_;
+	my @cmd = ($vlc_exe,
+		qw(--ignore-config -I luaintf --lua-intf dumpmeta -V dummy -A dummy
+		   --no-video-title --no-media-library),
+		$file, 'vlc://quit');
+
+	my (%info, @streams, $stream);
+
+	foreach my $line (exec_cmd($client, @cmd)) {
+		if ($line =~ m!\blua interface: +(name|uri|duration|encoded_by|filename): (.+)$!) {
+			if (defined($field) && $1 eq $field) {
+				return $2;
+			}
+
+			$info{$1} = $2;
+		}
+		elsif ($line =~ m!\blua interface: +Stream (\d+)$!) {
+			$stream = $streams[$1] = {};
+		}
+		elsif ($stream && $line =~ m!\blua interface: +([^:]+): (.+)$!) {
+			$stream->{$1} = $2;
+		}
+	}
+
+	for (my $i = 0; $i < @streams; $i++) {
+		$streams[$i]{track} = $i;
+		$streams[$i]{Language} ||= 'English';
+
+		if ($streams[$i]{Type} eq 'Audio') {
+			push @{$info{'tracks-audio'}}, $streams[$i];
+		}
+		elsif ($streams[$i]{Type} eq 'Video') {
+			push @{$info{'tracks-video'}}, $streams[$i];
+		}
+	}
+
+	return \%info;
+}
+
+sub encoding_status($)
+{
+	my ($movie) = @_;
+
+	if (-s "$cache_dir/$movie/stream.m3u8") {
+		my $max_segment = 1;
+		while (1) {
+			my $segment = sprintf("$cache_dir/$movie/stream-%03d.ts", $max_segment++);
+			next if -f $segment;
+			last;
+		}
+
+		if (-f "$cache_dir/$movie/complete.txt") {
+			return ('complete', $max_segment - 1);
+		}
+		else {
+			return (sprintf('segments-%d', $max_segment - 1), $max_segment - 1);
+		}
+	}
+
+	return ('segments-0', 0);
+}
+
+sub cache_delete($$)
+{
+	my ($client, $id) = @_;
+	my $found = 0;
+
+	if (!defined($id) || !length($id)) {
+		return (undef, "Invalid parameters given");
+	}
+
+	if (opendir D, $cache_dir) {
+		while (defined(my $entry = readdir D)) {
+			my $params = "$cache_dir/$entry/params.txt";
+			next unless -f $params;
+
+			my $json = json_read($params);
+			next if ref($json) ne 'HASH' || $json->{serverid} ne $id;
+
+			my $pid = -1;
+			if (open P, '<', "$cache_dir/$entry/encode.pid") {
+				if (defined(my $line = readline P)) {
+					if ($line =~ m!^(\d+)$!) {
+						$pid = $1;
+					}
+				}
+				close P;
+			}
+
+			if ($pid > -1) {
+				kill('KILL', $pid);
+			}
+
+			if (system('rm', '-r', "$cache_dir/$entry") != 0) {
+				warn "Unable to purge cache directory for id $id\n";
+			}
+
+			$found++;
+			last;
+		}
+
+		closedir D;
+	}
+
+	if ($found) {
+		return (1, "Movie deleted");
+	}
+	else {
+		return (undef, "Unable to find movie");
+	}
+}
+
+sub cache_lookup($)
+{
+	my ($file) = @_;
+
+	my $path = sprintf '%s/%s/params.txt',
+		$cache_dir, Digest::MD5::md5_hex($file);
+
+	if (-f $path) {
+		return json_read($path);
+	}
+
+	return undef;
+}
+
+sub playlist_build()
+{
+	if (opendir D, $cache_dir) {
+		if (open L, '>', "$cache_dir/playlist.txt") {
+			flock L, Fcntl::LOCK_EX;
+			seek L, 0, 0;
+			truncate L, 0;
+
+			while (defined(my $id = readdir D)) {
+				if (-f "$cache_dir/$id/params.txt") {
+					print L "$id\n";
+				}
+			}
+
+			flock L, Fcntl::LOCK_UN;
+			close L;
+		}
+
+		closedir D;
+	}
+}
+
+sub playlist_read()
+{
+	my @playlist;
+
+	unless (-f "$cache_dir/playlist.txt") {
+		warn "Rebuilding playlist\n";
+		playlist_build();
+	}
+
+	if (open L, '<', "$cache_dir/playlist.txt") {
+		flock L, Fcntl::LOCK_SH;
+		seek L, 0, 0;
+
+		while (defined(my $id = readline L)) {
+			chomp $id;
+			if (-f "$cache_dir/$id/params.txt") {
+				my $info = json_read("$cache_dir/$id/params.txt");
+				if ($info) {
+					push @playlist, $info;
+				}
+			}
+		}
+
+		flock L, Fcntl::LOCK_UN;
+		close L;
+	}
+
+	return @playlist;
+}
+
+sub playlist_add($)
+{
+	my ($id) = @_;
+	my @list = playlist_read();
+
+	if (grep { $_->{serverid} eq $id } @list) {
+		return (undef, "Media [$id] already on playlist");
+	}
+
+	unless (-f "$cache_dir/$id/params.txt") {
+		return (undef, "Media [$id] not found in cache");
+	}
+
+	if (open L, '+<', "$cache_dir/playlist.txt") {
+		flock L, Fcntl::LOCK_EX;
+		seek L, 0, 2;
+		print L "$id\n";
+		flock L, Fcntl::LOCK_UN;
+		close L;
+
+		my $info = json_read("$cache_dir/$id/params.txt") || { serverid => $id };
+		return ($info, "Media [$id] added to playlist");
+	}
+
+	return (undef, "Unable to open playlist: $!");
+}
+
+sub playlist_remove($)
+{
+	my ($id) = @_;
+	my @list = playlist_read();
+
+	unless (grep { $_->{serverid} eq $id } @list) {
+		return (undef, "Media [$id] not on playlist");
+	}
+
+	if (open L, '+<', "$cache_dir/playlist.txt") {
+		flock L, Fcntl::LOCK_EX;
+		seek L, 0, 0;
+		truncate L, 0;
+
+		my $info;
+
+		foreach my $entry (@list) {
+			if ($entry->{serverid} ne $id) {
+				print L $entry->{serverid}, "\n";
+			}
+			else {
+				$info = $entry;
+			}
+		}
+
+		flock L, Fcntl::LOCK_UN;
+		close L;
+
+		return ($info || { serverid => $id }, "Media [$id] removed from playlist");
+	}
+
+	return (undef, "Unable to open playlist: $!");
+}
+
+sub playlist_move($;$)
+{
+	my ($id, $before) = @_;
+	my @list = playlist_read();
+
+	unless (grep { $_->{serverid} eq $id } @list) {
+		return (undef, "Media [$id] not on playlist");
+	}
+
+	unless (!$before || grep { $_->{serverid} eq $before } @list) {
+		return (undef, "Media [$before] not on playlist");
+	}
+
+	if (open L, '+<', "$cache_dir/playlist.txt") {
+		flock L, Fcntl::LOCK_EX;
+		seek L, 0, 0;
+		truncate L, 0;
+
+		my $info;
+
+		foreach my $entry (@list) {
+			if ($entry->{serverid} eq $id) {
+				$info = $entry;
+				next;
+			}
+
+			if ($before && $entry->{serverid} eq $before) {
+				print L "$id\n";
+			}
+
+			print L $entry->{serverid}, "\n";
+		}
+
+		unless ($before) {
+			print L "$id\n";
+		}
+
+		flock L, Fcntl::LOCK_UN;
+		close L;
+
+		return ($info || { serverid => $id }, "Media [$id] moved on playlist");
+	}
+
+	return (undef, "Unable to open playlist: $!");
+}
+
+sub playlist_prev($)
+{
+	my ($id) = @_;
+	my @list = playlist_read();
+
+	for (my $i = 0; $i < @list; $i++) {
+		if ($list[$i]->{serverid} eq $id) {
+			return $i ? $list[$i-1] : undef;
+		}
+	}
+
+	return undef;
+}
+
+sub playlist_next($)
+{
+	my ($id) = @_;
+	my @list = playlist_read();
+
+	for (my $i = 0; $i < @list; $i++) {
+		if ($list[$i]->{serverid} eq $id) {
+			return ($i+1 < @list) ? $list[$i+1] : undef;
+		}
+	}
+
+	return undef;
+}
+
+sub path_rel($$)
+{
+	my ($root, $path) = @_;
+
+	if (!defined($root) || !defined($path)) {
+		return undef;
+	}
+
+	$root = Cwd::realpath($root);
+	$path = Cwd::realpath($path);
+
+	if ($path eq $root) {
+		return '';
+	}
+
+	if (length($path) < length($root) ||
+		index($path, $root) != 0 ||
+		substr($path, length($root), 1) ne '/') {
+		return undef;
+	}
+
+	return substr($path, length($root) + 1);
+}
+
+sub path_abs($$)
+{
+	my ($root, $path) = @_;
+
+	if (!defined($root) || !defined($path)) {
+		return undef;
+	}
+
+	$path = Cwd::realpath("$root/$path");
+
+	if (defined(path_rel($root, $path))) {
+		return $path;
+	}
+
+	return undef;
+}
+
+sub html_esc($)
+{
+	my ($s) = @_;
+	$s =~ s/([<>&"])/sprintf '&#%d;', ord $1/eg
+		if defined $s;
+	return $s;
+}
+
+sub url_enc($)
+{
+	my ($s) = @_;
+	$s =~ s!([^a-zA-Z0-9_./-])!sprintf '%%%02x', ord $1!eg
+		if defined $s;
+	return $s;
+}
+
+sub url_dec($)
+{
+	my ($s) = @_;
+	$s =~ s!%([a-fA-F0-9][a-fA-F0-9])!chr hex $1!eg
+		if defined $s;
+	return $s;
+}
+
+sub html_header()
+{
+	return q{
+		<html>
+			<head>
+				<title>iOS Streaming</title>
+				<meta name="viewport" content="width=device-width, initial-scale=1.0">
+				<link rel="stylesheet" type="text/css" href="/resource/app.css">
+				<script type="text/javascript" src="/resource/app.js"></script>
+			</head>
+			<body>
+				<div id="loader">&nbsp;</div>
+				<div id="banner">&nbsp;</div>
+				<div id="player">
+					<h2></h2>
+					<div>
+						<audio controls poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></audio>
+						<video controls poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></video>
+					</div>
+					<nav>
+						<span class="r" onclick="closeMovie()">&laquo; Close</span>
+						<span class="i" data-action="prev-movie">&laquo; Previous</span>
+						<span class="i" data-action="next-movie">Next &raquo;</span>
+						<span class="g" data-open="#player .playlist">&hellip;</span>
+
+					</nav>
+					<div class="playlist" data-init="loadPlaylist"></div>
+				</div>
+				<div id="info">
+					<h2></h2>
+					<div>
+						<span>
+							<img onerror="this.style.display='none'">
+						</span>
+						<dl></dl>
+					</div>
+					<nav>
+						<span class="i" data-action="close-info">&laquo; Close</span>
+						<span class="g" data-action="open-movie">Play &raquo;</span>
+					</nav>
+				</div>
+	};
+}
+
+sub html_footer()
+{
+	return q{
+			</body>
+		</html>
+	};
+}
+
+sub html_reply($$;$$)
+{
+	my ($client, $body, $code, $msg) = @_;
+	return $client->send_response(HTTP::Response->new(
+		$code || 200, $msg || "OK",
+		[ "Content-Type" => "text/html; charset=UTF-8" ],
+		html_header() . ($body || '') . html_footer()
+	));
+}
+
+sub json_reply($$;$$)
+{
+	my ($client, $data, $code, $msg) = @_;
+	return $client->send_response(HTTP::Response->new(
+		$code || 200, $msg || "OK",
+		[ "Content-Type" => "application/json; charset=UTF-8" ],
+		$data ? JSON->new->utf8->encode($data) : 'null'
+	));
+}
+
+sub data_resource($)
+{
+	my ($name) = @_;
+	my ($file, $type, $data);
+
+	binmode DATA;
+	flock DATA, Fcntl::LOCK_EX;
+
+	my $offset = tell DATA;
+
+	while (defined(my $line = readline DATA)) {
+		chomp $line;
+
+		if ($line =~ m!^name=(.+)$!) {
+			$file = $1;
+			$type = 'application/octet-stream';
+			$data = '';
+		}
+		elsif ($file && $line =~ m!^type=(.+)$!) {
+			$type = $1;
+		}
+		elsif ($file && $line =~ m!^([a-fA-F0-9]+) *$!) {
+			$data .= pack 'H*', $1;
+		}
+		elsif ($file && $file eq $name && length($data)) {
+			last;
+		}
+	}
+
+	seek DATA, $offset, 0;
+	flock DATA, Fcntl::LOCK_UN;
+
+	if (defined($file) && $file eq $name && length($data)) {
+		return wantarray ? ($data, $type) : $data;
+	}
+
+	return ();
+}
+
+
+sub handle_file($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($cache_dir, $file);
+
+	if (defined($path) && -f $path) {
+		warn "F: $path\n";
+		return $client->send_file_response($path);
+	}
+
+	warn sprintf "404: %s (%s)\n", $path || '?', $request->uri->path;
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_resource($$$)
+{
+	my ($client, $request, $file) = @_;
+	my ($data, $type) = data_resource($file);
+
+	if (defined($data) && defined($type)) {
+		warn "D: $file\n";
+		return $client->send_response(HTTP::Response->new(200, "OK", [
+			"Content-Type" => $type,
+		], $data));
+	}
+
+	warn sprintf "404: %s\n", $file;
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_seekable($$$)
+{
+	my ($client, $request, $movie) = @_;
+	my $path = path_abs($cache_dir, "$movie/stream.m3u8");
+
+	if (open F, '<', $path) {
+		local $/;
+		my $data = readline F;
+		$data =~ s!^#EXT-X-PLAYLIST-TYPE:EVENT\b!#EXT-X-PLAYLIST-TYPE:VOD!;
+		$data .= "\n#EXT-X-ENDLIST\n" unless $data =~ m!^#EXT-X-ENDLIST\b!;
+		close F;
+
+		warn "S: $path\n";
+		return $client->send_response(HTTP::Response->new(200, "OK", [
+			'Content-Type' => 'application/vnd.apple.mpegurl'
+		], $data));
+	}
+
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_stream($$$)
+{
+	my ($client, $request, $movie) = @_;
+
+	for (my $try = 0; $try < 5; $try++) {
+		if (-s "$cache_dir/$movie/stream.m3u8") {
+			return $client->send_file_response("$cache_dir/$movie/stream.m3u8");
+		}
+
+		sleep 1;
+	}
+
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_browse($$$)
+{
+	my ($client, $request, $dir) = @_;
+
+	my $path = path_abs($root_dir, $dir);
+	my $up   = path_rel($root_dir, path_abs($root_dir, "$dir/.."));
+
+	my $page = sprintf q{
+		<header>
+			<h1><a href="/">iOS Streaming</a></h1>
+			<span>%s</span>
+		</header>
+	}, path_rel($root_dir, $path);
+
+	if (opendir P, $path) {
+		if (defined($up)) {
+			$page .= sprintf q{
+				<li>
+					<a class="b" href="/browse/%s">../</a>
+			        <em class="label">parent</em>
+			    </li>
+			}, url_enc($up);
+		}
+
+		my (@dirs, @files);
+		while (defined(my $entry = readdir P)) {
+			my $file = "$path/$entry";
+
+			if (-d $file && $entry ne '.' && $entry ne '..') {
+				push @dirs, $entry;
+			}
+			elsif (-f $file && $entry =~ m!\.(mp4|mov|ogg|flv|wmv|avi|mkv|mp3|m4a|wma)$!i) {
+				push @files, $entry;
+			}
+		}
+
+		closedir P;
+
+		foreach my $entry (sort @dirs) {
+			$page .= sprintf q{
+				<li>
+					<a class="b" href="/browse/%s">%s/</a>
+			        <em class="label">directory</em>
+			    </li>
+			}, url_enc(path_rel($root_dir, "$path/$entry")),
+			   html_esc($entry);
+		}
+
+		foreach my $entry (sort @files) {
+			my $file = path_rel($root_dir, "$path/$entry");
+
+			$page .= sprintf q{
+				<li data-info="%s">
+					<span class="t" style="background-image:url(/thumbnail/%s)">&nbsp;</span>
+			        <span class="b">%s</span>
+			        <span class="label">%.02f MB</span>
+					<nav>
+						<span class="g" data-action="add-movie">Add</span>
+						<span class="i" data-action="play-movie">Play</span>
+					</nav>
+					<span data-open>…</span>
+			    </li>
+			}, html_esc(JSON->new->utf8->encode({ path => $file })),
+			   url_enc($file),
+			   html_esc($entry),
+			   (stat "$path/$entry")[7] / 1024 / 1024;
+		}
+	}
+
+	$page .= q{
+		</ul>
+		<nav>
+	};
+
+	if (defined($up)) {
+		$page .= sprintf q{
+			<a class="i" href="/browse/%s">&laquo; Parent directory</a>
+		}, url_enc($up);
+	}
+
+	$page .= q{
+			<a class="r" href="/">Overview &raquo;</a>
+		</nav>
+	};
+
+	return html_reply($client, $page);
+}
+
+sub handle_thumbnail($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($root_dir, $file);
+	if ($path) {
+		my $data = vlc_thumbnail($client, $path);
+		if ($data) {
+			return $client->send_response(HTTP::Response->new(200, "OK", [
+				'Content-Type'  => 'image/png',
+				'Expires'       => POSIX::strftime('%a, %e %b %Y %H:%M:%S %Z', localtime(time() + 30758400)),
+				'Cache-Control' => 'max-age=30758400'
+			], $data));
+		}
+	}
+
+	return $client->send_error(404, 'No such file or directory');
+}
+
+sub handle_add($$$)
+{
+	my ($client, $request, $file) = @_;
+	my $path = path_abs($root_dir, $file);
+	if ($path) {
+		my ($filename, $basename) = $path =~ m!/(([^/]+?)\.[^./]+)$!;
+		my ($info, $error) = vlc_transcode($client, {
+			type      => "file",
+			name      => $filename,
+			file      => $path,
+			date      => POSIX::strftime("%Y-%m-%d %H:%M:%S %z", localtime),
+
+			clientid  => "htmlview",
+			good      => "HLS",
+			set       => "HLS",
+
+			keyframe  => "90",
+			width     => "960",
+			vb        => "1800",
+			ab        => "128",
+		});
+
+		if ($info) {
+			playlist_add($info->{serverid});
+			return json_reply($client, $info);
+		}
+
+		return $client->send_error(500, "Transcoding error: $error");
+	}
+
+	return $client->send_error(404, "Invalid path requested");
+}
+
+sub handle_delete($$$)
+{
+	my ($client, $request, $movie) = @_;
+	my ($ok, $error) = cache_delete($client, $movie);
+
+	if ($ok) {
+		playlist_remove($movie);
+	}
+
+	return $client->send_redirect(
+		sprintf 'http://%s/', $request->header('Host'));
+}
+
+sub handle_index($$)
+{
+	my ($client, $request) = @_;
+
+	my $page = q{
+		<header>
+			<h1>iOS Streaming</h1>
+		</header>
+		<ul>
+	};
+
+	foreach my $info (playlist_read()) {
+		my ($status, $segments) = encoding_status($info->{serverid});
+		my $duration = $segments * ($info->{seglen} || 10);
+		my $name = ($info->{meta} && $info->{meta}{name}) ? $info->{meta}{name} : ($info->{name} || $info->{serverid});
+
+		$page .= sprintf q{
+			<li id="%s" data-info="%s" draggable="true" on2dragstart="dragStart(event)" on2drop="dragEnd(event)" on2dragover="dragOver(event)" on2dragleave="dragOut(event)">
+				<span class="t" style="background-image:url(/thumbnail/%s)">
+					<img src="/resource/play.png" data-action="open-movie">
+				</span>
+				<span class="b">
+					<strong>%s</strong><br>
+					%s: %02d:%02d:%02d
+				</span>
+				<nav>
+					<span class="i" drag-handle>&nbsp;↕&nbsp;</span>
+					<span class="g" data-action="open-info">Info</span>
+					<span class="r" data-action="delete-movie">Delete</span>
+				</nav>
+				<span data-open>…</span>
+			</li>
+		}, html_esc($info->{serverid}),
+		   html_esc(JSON->new->utf8->encode($info || {})),
+		   url_enc($info->{link}),
+		   html_esc($name),
+		   ($status eq 'complete') ? 'Ready' : 'Transcoding',
+		   $duration / 3600, $duration % 3600 / 60, $duration % 60;
+	}
+
+	$page .= q{
+		</ul>
+		<nav>
+			<a class="i" href="/browse/">Add movies &raquo;</a>
+		</nav>
+	};
+
+	return html_reply($client, $page);
+}
+
+sub handle_playlist($$)
+{
+	my ($client, $request) = @_;
+	my @list = playlist_read();
+	return json_reply($client, { playlist => \@list });
+}
+
+sub handle_move($$$$)
+{
+	my ($client, $request, $id, $before) = @_;
+	my ($info, $error) = playlist_move($id, $before);
+
+	if ($info) {
+		return json_reply($client, $info);
+	}
+
+	return $client->send_error(500, $error);
+}
+
+sub handle_prev($$$)
+{
+	my ($client, $request, $id) = @_;
+	return json_reply($client, playlist_prev($id));
+}
+
+sub handle_next($$$)
+{
+	my ($client, $request, $id) = @_;
+	return json_reply($client, playlist_next($id));
+}
+
+
+sub handle_client($)
+{
+	my ($client) = @_;
+
+	while (my $request = $client->get_request) {
+		for (url_dec($request->uri->path)) {
+			m!^/browse/(.*)$! &&
+				return handle_browse($client, $request, $1 || '/');
+
+			m!^/thumbnail/(.+)$! &&
+				return handle_thumbnail($client, $request, $1);
+
+			m!^/add/(.+)$! &&
+				return handle_add($client, $request, $1);
+
+			m!^/delete/(.+)$! &&
+				return handle_delete($client, $request, $1);
+
+			m!^/resource/(.+)$! &&
+				return handle_resource($client, $request, $1);
+
+			m!^/playlist$! &&
+				return handle_playlist($client, $request);
+
+			m!^/move/([^/]+)/([^/]*)$! &&
+				return handle_move($client, $request, $1, $2);
+
+			m!^/prev/([^/]+)$! &&
+				return handle_prev($client, $request, $1);
+
+			m!^/next/([^/]+)$! &&
+				return handle_next($client, $request, $1);
+
+			m!^/([^/]+)/stream\.m3u8$! &&
+				return handle_stream($client, $request, $1);
+
+			m!^/([^/]+)/seekable\.m3u8$! &&
+				return handle_seekable($client, $request, $1);
+
+			m!^/$! &&
+				return handle_index($client, $request);
+
+			return handle_file($client, $request, $_);
+		}
+	}
+}
+
+
+LWP::MediaTypes::add_type('application/x-mpegURL', 'm3u8');
+LWP::MediaTypes::add_type('video/MP2T', 'ts');
+
+while (my $client = $daemon->accept) {
+	while (waitpid(-1, WNOHANG) > 0) { }
+
+	my $pid = fork;
+
+	if (!defined $pid) {
+		warn "Unable to fork: $!\n";
+		next;
+	}
+
+	if ($pid == 0) {
+		handle_client($client);
+		exit;
+	}
+
+	$client->close;
+}
+
+
+__DATA__
+
