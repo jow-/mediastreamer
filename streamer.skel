@@ -874,8 +874,10 @@ sub data_resource($)
 	my ($name) = @_;
 	my ($file, $type, $data);
 
+	open SELF, '<', $0;
+	flock SELF, Fcntl::LOCK_EX;
+
 	binmode DATA;
-	flock DATA, Fcntl::LOCK_EX;
 
 	my $offset = tell DATA;
 
@@ -899,7 +901,9 @@ sub data_resource($)
 	}
 
 	seek DATA, $offset, 0;
-	flock DATA, Fcntl::LOCK_UN;
+
+	flock SELF, Fcntl::LOCK_UN;
+	close SELF;
 
 	if (defined($file) && $file eq $name && length($data)) {
 		return wantarray ? ($data, $type) : $data;
