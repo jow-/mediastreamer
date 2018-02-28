@@ -1039,7 +1039,7 @@ sub handle_browse($$$)
 			my $info = cache_lookup($file);
 
 			$page .= sprintf q{
-				<li class="%s" data-info="%s">
+				<li class="%s" data-path="%s">
 					<span class="t" style="background-image:url(/thumbnail/%s)">&nbsp;</span>
 			        <span class="b">%s</span>
 			        <span class="label">%.02f MB</span>
@@ -1050,7 +1050,7 @@ sub handle_browse($$$)
 					<span data-open>…</span>
 			    </li>
 			}, $info ? 'existing' : '',
-			   html_esc(JSON->new->utf8->encode({ path => $file })),
+			   html_esc($file),
 			   url_enc($file),
 			   html_esc($entry),
 			   (stat "$path/$entry")[7] / 1024 / 1024;

@@ -88,61 +88,49 @@ function attachEvents(nodes, events, func) {
 				node.addEventListener(event, func, false);
 }
 
-function findMovieInfo(elem) {
-	while (elem && elem.getAttribute) {
-		var info = elem.getAttribute('data-info');
-		if (info)
-			return JSON.parse(info);
-
-		elem = elem.parentNode;
-	}
-
-	return null;
-}
-
 function addMovie(elem, autoplay) {
-	var info = findMovieInfo(elem),
-	    parent = findParentNode('[data-info]', elem);
+	var parent = findParentNode('[data-path]', elem);
 
-	if (parent.classList.contains('disabled'))
+	if (!parent || parent.classList.contains('disabled'))
 		return;
 
-	httpcall('/add/' + encodeURIComponent(info.path), function(response) {
-		if (response.status === 200) {
-			info = JSON.parse(response.responseText);
+	httpcall('/add/' + encodeURIComponent(parent.getAttribute('data-path')),
+		function(response) {
+			if (response.status === 200) {
+				info = JSON.parse(response.responseText);
 
-			if (autoplay && info) {
-				window.currentMedia = info;
-				openMovie();
+				if (autoplay && info) {
+					window.currentMedia = info;
+					openMovie();
+				}
+
+				parent.classList.add('disabled');
+				return [true, 'Movie "' + (info.meta ? info.meta.name : info.name) + '" added to playlist.'];
+			} else {
+				return [false, 'Incompatible media file!'];
 			}
-
-			parent.classList.add('disabled');
-			return [true, 'Movie "' + (info.meta ? info.meta.name : info.name) + '" added to playlist.'];
-		} else {
-			return [false, 'Incompatible media file!'];
-		}
-	});
+		});
 
 	return false;
 }
 
 function deleteMovie(elem) {
-	var info = findMovieInfo(elem),
-	    parent = findParentNode('[data-info]', elem);
+	var parent = findParentNode('[data-media]', elem);
 
-	if (!info || !parent)
+	if (!parent || parent.classList.contains('disabled'))
 		return;
 
 	parent.classList.add('disabled');
 
-	httpcall('/delete/' + info.serverid, function(response) {
-		if (response.status === 200) {
-			parent.parentNode.removeChild(parent);
-			return [true, 'Movie removed.'];
-		} else {
-			return [false, 'Unable to delete movie!'];
-		}
-	});
+	httpcall('/delete/' + encodeURIComponent(parent.getAttribute('data-media')),
+		function(response) {
+			if (response.status === 200) {
+				parent.parentNode.removeChild(parent);
+				return [true, 'Movie removed.'];
+			} else {
+				return [false, 'Unable to delete movie!'];
+			}
+		});
 
 	return false;
 }
@@ -156,9 +144,10 @@ function openMovie(elem) {
 	    list = p.querySelector('.playlist[opened]'),
 	    prev = p.querySelector('[data-action=prev-movie]'),
 	    next = p.querySelector('[data-action=next-movie]'),
-	    seek = p.querySelector('[data-action=seekable-movie]');
-
-    var info = findMovieInfo(elem) || window.currentMedia;
+	    seek = p.querySelector('[data-action=seekable-movie]'),
+	    parent = findParentNode('[data-media]', elem),
+	    mediaid = parent ? parent.getAttribute('data-media') : null,
+	    info = (mediaid ? window.mediaInfo[mediaid] : null) || window.currentMedia;
 
 	if (!info)
 		return;
@@ -304,9 +293,10 @@ function openInfo(elem)
 	    n = i.nextElementSibling,
 	    h = i.querySelector('h2'),
 	    m = i.querySelector('dl'),
-	    t = i.querySelector('img');
-
-	var info = findMovieInfo(elem) || window.currentMedia;
+	    t = i.querySelector('img'),
+	    parent = findParentNode('[data-media]', elem),
+	    mediaid = parent ? parent.getAttribute('data-media') : null,
+	    info = (mediaid ? window.mediaInfo[mediaid] : null) || window.currentMedia;
 
 	if (!info)
 		return;
@@ -375,6 +365,35 @@ function closeInfo()
 	document.body.classList.remove('modal');
 }
 
+function renderPlaylistItem(item)
+{
+	var active = (window.currentMedia && window.currentMedia.serverid === item.serverid) ? 'active' : '',
+	    li = document.createElement('li');
+
+	li.setAttribute('data-media', item.serverid);
+	li.setAttribute('draggable', true);
+
+	li.className = active;
+	li.innerHTML = '' +
+		'<span class="t" style="background-image:url(&quot;/thumbnail/' + encodeURIComponent(item.link) + '&quot;)">' +
+			'<img src="/resource/play.png" data-action="open-movie">' +
+		'</span>' +
+		'<span class="b">' +
+			'<strong>' + esc(item.meta.name || item.name) + '</strong><br>' +
+			duration(item.meta.duration) +
+			(item.transcoding_status === 'complete' ? '' : ' (transcoding: ' + duration(item.transcoding_duration) + ')') +
+		'</span>' +
+		'<nav>' +
+			'<span class="i" data-action="start-drag">&nbsp;↕&nbsp;</span>' +
+			'<span class="g" data-action="open-info">Info</span>' +
+			'<span class="r" data-action="delete-movie">Delete</span>' +
+		'</nav>' +
+		'<span data-open>…</span>'
+	;
+
+	return li;
+}
+
 function loadPlaylist(ev)
 {
 	var self = this,
@@ -394,36 +413,25 @@ function loadPlaylist(ev)
 
 		if (response.status === 200) {
 			try {
-				var json = JSON.parse(response.responseText);
-				var list = '';
+				var media = [],
+				    json = JSON.parse(response.responseText),
+				    ul = document.createElement('ul');
 
 				for (var i = 0, item; item = json.playlist[i]; i++) {
-					var active = (window.currentMedia && window.currentMedia.serverid === item.serverid) ? 'active' : '';
-
-					list += '' +
-						'<li class="' + active + '" id="' + esc(item.serverid) + '" data-info="' + esc(JSON.stringify(item)) + '" draggable>' +
-							'<span class="t" style="background-image:url(&quot;/thumbnail/' + encodeURIComponent(item.link) + '&quot;)">' +
-								'<img src="/resource/play.png" data-action="open-movie">' +
-							'</span>' +
-							'<span class="b">' +
-								'<strong>' + esc(item.meta.name || item.name) + '</strong><br>' +
-								duration(item.meta.duration) +
-								(item.transcoding_status === 'complete' ? '' : ' (transcoding: ' + duration(item.transcoding_duration) + ')') +
-							'</span>' +
-							'<nav>' +
-								'<span class="i" data-action="start-drag">&nbsp;↕&nbsp;</span>' +
-								'<span class="g" data-action="open-info">Info</span>' +
-								'<span class="r" data-action="delete-movie">Delete</span>' +
-							'</nav>' +
-							'<span data-open>…</span>' +
-						'</li>'
-					;
+					media[item.serverid] = item;
+					media[item.serverid].position = i;
+					ul.appendChild(renderPlaylistItem(item));
 				}
 
-				self.innerHTML = '<ul>' + list + '</ul>';
+				while (self.firstChild)
+					self.removeChild(self.firstChild);
+
+				self.appendChild(ul);
 
 				var active = self.querySelector('.active');
 				if (active) active.scrollIntoView();
+
+				window.mediaInfo = media;
 
 				return true;
 			}
@@ -579,7 +587,11 @@ function handleTouchEnd(ev) {
 		drag.node.removeAttribute('opened');
 		drag.node.style.animation = 'highlight 1s 1';
 
-		httpcall('/move/' + drag.node.id + '/' + (drag.node.nextElementSibling ? drag.node.nextElementSibling.id : ''),
+		var id1 = drag.node.getAttribute('data-media'),
+		    id2 = drag.node.nextElementSibling
+		        ? drag.node.nextElementSibling.getAttribute('data-media') : '';
+
+		httpcall('/move/' + id1 + '/' + id2,
 		    function(response) {
 				if (response.status === 200) {
 					return true;
