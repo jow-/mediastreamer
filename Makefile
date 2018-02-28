@@ -1,8 +1,8 @@
 RES_SRC := $(sort $(wildcard resources/*))
 RES_BIN := $(patsubst resources/%,build/%,$(RES_SRC))
 
-MIMETYPE.css := text/css
-MIMETYPE.js  := text/javascript
+MIMETYPE.css := text/css; charset=UTF-8
+MIMETYPE.js  := text/javascript; charset=UTF-8
 
 ARGS ?= 8080 /media
 

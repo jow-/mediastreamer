@@ -585,6 +585,12 @@ sub playlist_read()
 			if (-f "$cache_dir/$id/params.txt") {
 				my $info = json_read("$cache_dir/$id/params.txt");
 				if ($info) {
+					my ($status, $segments) = encoding_status($id);
+					my $duration = $segments * ($info->{seglen} || 10);
+
+					$info->{transcoding_status} = $status;
+					$info->{transcoding_duration} = $duration;
+
 					push @playlist, $info;
 				}
 			}
@@ -812,7 +818,7 @@ sub html_header()
 				<div id="banner">&nbsp;</div>
 				<div id="player">
 					<h2></h2>
-					<div>
+					<div class="media">
 						<audio controls poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></audio>
 						<video controls poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></video>
 					</div>
@@ -820,8 +826,8 @@ sub html_header()
 						<span class="r" onclick="closeMovie()">&laquo; Close</span>
 						<span class="i" data-action="prev-movie">&laquo; Previous</span>
 						<span class="i" data-action="next-movie">Next &raquo;</span>
+						<span class="y" data-action="seekable-movie">&laquo;&raquo;</span>
 						<span class="g" data-open="#player .playlist">&hellip;</span>
-
 					</nav>
 					<div class="playlist" data-init="loadPlaylist"></div>
 				</div>
@@ -991,7 +997,8 @@ sub handle_browse($$$)
 			<h1><a href="/">iOS Streaming</a></h1>
 			<span>%s</span>
 		</header>
-	}, path_rel($root_dir, $path);
+		<ul class="browser">
+	}, path_rel($root_dir, $path) || '/';
 
 	if (opendir P, $path) {
 		if (defined($up)) {
@@ -1029,9 +1036,10 @@ sub handle_browse($$$)
 
 		foreach my $entry (sort @files) {
 			my $file = path_rel($root_dir, "$path/$entry");
+			my $info = cache_lookup($file);
 
 			$page .= sprintf q{
-				<li data-info="%s">
+				<li class="%s" data-info="%s">
 					<span class="t" style="background-image:url(/thumbnail/%s)">&nbsp;</span>
 			        <span class="b">%s</span>
 			        <span class="label">%.02f MB</span>
@@ -1041,7 +1049,8 @@ sub handle_browse($$$)
 					</nav>
 					<span data-open>…</span>
 			    </li>
-			}, html_esc(JSON->new->utf8->encode({ path => $file })),
+			}, $info ? 'existing' : '',
+			   html_esc(JSON->new->utf8->encode({ path => $file })),
 			   url_enc($file),
 			   html_esc($entry),
 			   (stat "$path/$entry")[7] / 1024 / 1024;
@@ -1139,40 +1148,7 @@ sub handle_index($$)
 		<header>
 			<h1>iOS Streaming</h1>
 		</header>
-		<ul>
-	};
-
-	foreach my $info (playlist_read()) {
-		my ($status, $segments) = encoding_status($info->{serverid});
-		my $duration = $segments * ($info->{seglen} || 10);
-		my $name = ($info->{meta} && $info->{meta}{name}) ? $info->{meta}{name} : ($info->{name} || $info->{serverid});
-
-		$page .= sprintf q{
-			<li id="%s" data-info="%s" draggable="true" on2dragstart="dragStart(event)" on2drop="dragEnd(event)" on2dragover="dragOver(event)" on2dragleave="dragOut(event)">
-				<span class="t" style="background-image:url(/thumbnail/%s)">
-					<img src="/resource/play.png" data-action="open-movie">
-				</span>
-				<span class="b">
-					<strong>%s</strong><br>
-					%s: %02d:%02d:%02d
-				</span>
-				<nav>
-					<span class="i" drag-handle>&nbsp;↕&nbsp;</span>
-					<span class="g" data-action="open-info">Info</span>
-					<span class="r" data-action="delete-movie">Delete</span>
-				</nav>
-				<span data-open>…</span>
-			</li>
-		}, html_esc($info->{serverid}),
-		   html_esc(JSON->new->utf8->encode($info || {})),
-		   url_enc($info->{link}),
-		   html_esc($name),
-		   ($status eq 'complete') ? 'Ready' : 'Transcoding',
-		   $duration / 3600, $duration % 3600 / 60, $duration % 60;
-	}
-
-	$page .= q{
-		</ul>
+		<div id="playlist"></div>
 		<nav>
 			<a class="i" href="/browse/">Add movies &raquo;</a>
 		</nav>

@@ -1,13 +1,15 @@
-function httpcall(link, cb) {
+function httpcall(link, cb, silent) {
 	var x = new XMLHttpRequest(),
 	    l = document.getElementById('loader'),
 	    b = document.getElementById('banner'),
 	    ln = l.nextElementSibling,
 	    bn = b.nextElementSibling;
 
-	ln.parentNode.removeChild(l);
-	l.classList.add('open');
-	ln.parentNode.insertBefore(l, ln);
+	if (!silent) {
+		ln.parentNode.removeChild(l);
+		l.classList.add('open');
+		ln.parentNode.insertBefore(l, ln);
+	}
 
 	x.onreadystatechange = function() {
 		if (x.readyState == 4) {
@@ -36,6 +38,7 @@ function httpcall(link, cb) {
 				else
 					b.classList.add('error');
 
+				b.innerText = msg;
 				b.classList.add('open');
 				bn.parentNode.insertBefore(b, bn);
 			}
@@ -56,7 +59,7 @@ function esc(s) {
 }
 
 function duration(s) {
-	var d = (s || '0,0').split(/,/),
+	var d = (s || 0).toString().split(/,/),
 	    ss = d[0] || 0,
 	    us = d[1] || 0;
 	return '' +
@@ -97,20 +100,9 @@ function findMovieInfo(elem) {
 	return null;
 }
 
-function findParent(elem) {
-	while (elem) {
-		if (elem.getAttribute('data-info'))
-			return elem;
-
-		elem = elem.parentNode;
-	}
-
-	return null;
-}
-
 function addMovie(elem, autoplay) {
 	var info = findMovieInfo(elem),
-	    parent = findParent(elem);
+	    parent = findParentNode('[data-info]', elem);
 
 	if (parent.classList.contains('disabled'))
 		return;
@@ -135,8 +127,8 @@ function addMovie(elem, autoplay) {
 }
 
 function deleteMovie(elem) {
-	var info = findMovieInfo(elem);
-	var parent = findParent(elem);
+	var info = findMovieInfo(elem),
+	    parent = findParentNode('[data-info]', elem);
 
 	if (!info || !parent)
 		return;
@@ -145,8 +137,8 @@ function deleteMovie(elem) {
 
 	httpcall('/delete/' + info.serverid, function(response) {
 		if (response.status === 200) {
-			return [true, 'Movie removed.'];
 			parent.parentNode.removeChild(parent);
+			return [true, 'Movie removed.'];
 		} else {
 			return [false, 'Unable to delete movie!'];
 		}
@@ -163,7 +155,8 @@ function openMovie(elem) {
 	    v = p.querySelector('video'),
 	    list = p.querySelector('.playlist[opened]'),
 	    prev = p.querySelector('[data-action=prev-movie]'),
-	    next = p.querySelector('[data-action=next-movie]');
+	    next = p.querySelector('[data-action=next-movie]'),
+	    seek = p.querySelector('[data-action=seekable-movie]');
 
     var info = findMovieInfo(elem) || window.currentMedia;
 
@@ -174,58 +167,45 @@ function openMovie(elem) {
 
 	if (list) list.removeAttribute('opened');
 
-	if (!window.currentMedia || info.serverid !== window.currentMedia.serverid) {
-		window.currentMedia = info;
-
-		httpcall('/prev/' + info.serverid, function(response) {
-			var json = (response.status === 200) ? JSON.parse(response.responseText) : null;
-			window.currentMedia.prev = json;
-			prev.style.display = json ? '' : 'none';
-			return true;
-		});
-
-		httpcall('/next/' + info.serverid, function(response) {
-			var json = (response.status === 200) ? JSON.parse(response.responseText) : null;
-			window.currentMedia.next = json;
-			next.style.display = json ? '' : 'none';
-			return true;
-		});
-
-		n.parentNode.removeChild(p);
-
-		p.classList.add('open');
-		h.innerText = (info.meta && info.meta.name) ? info.meta.name : info.name;
-		n.parentNode.insertBefore(p, n);
-		document.body.classList.add('modal');
-
-		v.style.maxWidth = v.parentNode.offsetWidth + 'px';
-		v.style.maxHeight = v.parentNode.offsetHeight + 'px';
-
-		if (info.meta && info.meta['tracks-video'] && info.meta['tracks-video'].length) {
-			p.style.backgroundImage = '';
-
-			a.src = '';
-			a.style.display = 'none';
-
-			v.src = '/' + encodeURIComponent(info.serverid) + '/stream.m3u8';
-			v.style.display = '';
-			v.style.backgroundImage = 'url(/thumbnail/' + encodeURIComponent(info.link) + ')';
-			v.load();
-			v.play();
-		} else {
-			p.style.backgroundImage = 'url(/resource/audio.png)';
-
-			a.src = '/' + encodeURIComponent(info.serverid) + '/stream.m3u8';
-			a.style.display = '';
-			a.load();
-			a.play();
-
-			v.src = '';
-			v.style.display = 'none';
-		}
+	if (elem && findParentNode('.active', elem)) {
+		(a.style.display !== 'none') ? a.play() : v.play();
+		return;
 	}
-	else {
-		a.src ? a.play() : v.play();
+
+	window.currentMedia = info;
+
+	n.parentNode.removeChild(p);
+
+	p.classList.add('open');
+	h.innerText = (info.meta && info.meta.name) ? info.meta.name : info.name;
+	seek.style.display = (info.transcoding_status === 'complete') ? 'none' : '';
+	n.parentNode.insertBefore(p, n);
+	document.body.classList.add('modal');
+
+	v.style.maxWidth = v.parentNode.offsetWidth + 'px';
+	v.style.maxHeight = v.parentNode.offsetHeight + 'px';
+
+	if (info.meta && info.meta['tracks-video'] && info.meta['tracks-video'].length) {
+		p.style.backgroundImage = '';
+
+		a.src = '';
+		a.style.display = 'none';
+
+		v.src = '/' + encodeURIComponent(info.serverid) + '/stream.m3u8';
+		v.style.display = '';
+		v.style.backgroundImage = 'url(/thumbnail/' + encodeURIComponent(info.link) + ')';
+		v.load();
+		v.play();
+	} else {
+		p.style.backgroundImage = 'url(/resource/audio.png)';
+
+		a.src = '/' + encodeURIComponent(info.serverid) + '/stream.m3u8';
+		a.style.display = '';
+		a.load();
+		a.play();
+
+		v.src = '';
+		v.style.display = 'none';
 	}
 
 	return false;
@@ -247,6 +227,75 @@ function closeMovie()
 	document.body.classList.remove('modal');
 
 	window.currentMedia = null;
+}
+
+function seekableMovie(elem)
+{
+	var p = document.getElementById('player'),
+	    a = p.querySelector('audio'),
+	    v = p.querySelector('video');
+
+    if (!window.currentMedia)
+		return;
+
+	var media = (a.style.display !== 'none') ? a : v,
+	    time = media.currentTime;
+
+	media.src = '/' + window.currentMedia.serverid + '/' +
+		(window.currentMedia.seekable ? 'stream.m3u8' : 'seekable.m3u8');
+
+	media.currentTime = time;
+	media.load();
+	media.play();
+
+	window.currentMedia.seekable = !window.currentMedia.seekable;
+	elem.innerText = window.currentMedia.seekable ? ' ∞ ' : '«»';
+}
+
+function prevMovie()
+{
+	if (!window.currentMedia)
+		return;
+
+	var p = document.getElementById('player'),
+	    r = p.querySelector('[data-action=prev-movie]'),
+	    n = p.querySelector('[data-action=next-movie]');
+
+	r.classList.add('disabled');
+
+	httpcall('/prev/' + window.currentMedia.serverid, function(response) {
+		var json = (response.status === 200) ? JSON.parse(response.responseText) : null;
+		if (json) {
+			window.currentMedia = json;
+			openMovie();
+			r.classList.remove('disabled');
+			n.classList.remove('disabled');
+		}
+		return true;
+	});
+}
+
+function nextMovie()
+{
+	if (!window.currentMedia)
+		return;
+
+	var p = document.getElementById('player'),
+	    r = p.querySelector('[data-action=prev-movie]'),
+	    n = p.querySelector('[data-action=next-movie]');
+
+	n.classList.add('disabled');
+
+	httpcall('/next/' + window.currentMedia.serverid, function(response) {
+		var json = (response.status === 200) ? JSON.parse(response.responseText) : null;
+		if (json) {
+			window.currentMedia = json;
+			openMovie();
+			r.classList.remove('disabled');
+			n.classList.remove('disabled');
+		}
+		return true;
+	});
 }
 
 function openInfo(elem)
@@ -324,14 +373,21 @@ function closeInfo()
 
 	i.classList.remove('open');
 	document.body.classList.remove('modal');
-
-	window.currentMedia = null;
 }
 
 function loadPlaylist(ev)
 {
-	var self = this;
+	var self = this,
+	    p = document.getElementById('player'),
+	    a = p.querySelector('audio')
+	    v = p.querySelector('video');
+
 	self.classList.add('loading');
+
+	if (p.classList.contains('open') && self.id !== 'playlist') {
+		a.pause();
+		v.pause();
+	}
 
 	httpcall('/playlist', function(response) {
 		self.classList.remove('loading');
@@ -345,20 +401,29 @@ function loadPlaylist(ev)
 					var active = (window.currentMedia && window.currentMedia.serverid === item.serverid) ? 'active' : '';
 
 					list += '' +
-						'<li class="' + active + '" data-info="' + esc(JSON.stringify(item)) + '">' +
+						'<li class="' + active + '" id="' + esc(item.serverid) + '" data-info="' + esc(JSON.stringify(item)) + '" draggable>' +
 							'<span class="t" style="background-image:url(&quot;/thumbnail/' + encodeURIComponent(item.link) + '&quot;)">' +
 								'<img src="/resource/play.png" data-action="open-movie">' +
 							'</span>' +
 							'<span class="b">' +
 								'<strong>' + esc(item.meta.name || item.name) + '</strong><br>' +
-								duration(item.meta.duration || '0,0') +
+								duration(item.meta.duration) +
+								(item.transcoding_status === 'complete' ? '' : ' (transcoding: ' + duration(item.transcoding_duration) + ')') +
 							'</span>' +
+							'<nav>' +
+								'<span class="i" data-action="start-drag">&nbsp;↕&nbsp;</span>' +
+								'<span class="g" data-action="open-info">Info</span>' +
+								'<span class="r" data-action="delete-movie">Delete</span>' +
+							'</nav>' +
+							'<span data-open>…</span>' +
 						'</li>'
 					;
 				}
 
 				self.innerHTML = '<ul>' + list + '</ul>';
-				self.querySelector('.active').scrollIntoView();
+
+				var active = self.querySelector('.active');
+				if (active) active.scrollIntoView();
 
 				return true;
 			}
@@ -368,7 +433,7 @@ function loadPlaylist(ev)
 		}
 
 		return [false, response.statusText];
-	});
+	}, true);
 }
 
 function dragStart(ev)
@@ -424,10 +489,7 @@ function handleTouchMove(ev) {
 	    drag = window.dragState;
 
 	if (!drag) {
-		var node = touch.target;
-
-		while (node && (!node.getAttribute || !node.getAttribute('draggable')))
-			node = node.parentNode;
+		var node = findParentNode('[draggable]', touch.target);
 
 		if (!node)
 			return;
@@ -459,19 +521,21 @@ function handleTouchMove(ev) {
 		dropable.removeAttribute('drop-below');
 	}
 
-	var deltaY = touch.screenY - drag.y,
-	    minY = (touch.screenY - window.pageYOffset - drag.offset),
+	var scrollParent = findParentNode(function(n) {
+		return n.offsetHeight < n.scrollHeight; },
+	drag.node) || document.body;
+
+	var deltaY = touch.clientY - drag.y,
+	    minY = touch.clientY - drag.offset,
 	    maxY = minY + drag.offset * 2;
 
 	if (deltaY < 0 && minY <= 50)
-		window.scrollBy(0, -10);
+		scrollParent.scrollTop -= 10;
 	else if (deltaY > 0 && maxY >= window.innerHeight - 50)
-		window.scrollBy(0, 10);
+		scrollParent.scrollTop += 10;
 
-	var target = document.elementFromPoint(touch.screenX, touch.screenY - window.pageYOffset);
-
-	while (target && (!target.getAttribute || !target.getAttribute('draggable')))
-		target = target.parentNode;
+	var target = findParentNode('[draggable]',
+		document.elementFromPoint(touch.screenX, touch.screenY - window.pageYOffset));
 
 	if (target) {
 		var node = drag.node.nextElementSibling ? drag.node : null;
@@ -486,7 +550,7 @@ function handleTouchMove(ev) {
 		target.setAttribute(node ? 'drop-below' : 'drop-above', true);
 	}
 
-	drag.y = touch.screenY;
+	drag.y = touch.clientY;
 	drag.target = target;
 
 	ev.preventDefault();
@@ -512,6 +576,7 @@ function handleTouchEnd(ev) {
 		drag.target.removeAttribute('drop-above');
 		drag.target.removeAttribute('drop-below');
 
+		drag.node.removeAttribute('opened');
 		drag.node.style.animation = 'highlight 1s 1';
 
 		httpcall('/move/' + drag.node.id + '/' + (drag.node.nextElementSibling ? drag.node.nextElementSibling.id : ''),
@@ -528,21 +593,22 @@ function handleTouchEnd(ev) {
 	window.dragState = null;
 }
 
+function findParentNode(cmp, node) {
+	while (node) {
+		if ((typeof(cmp) === 'string' && node.matches && node.matches(cmp)) ||
+		    (typeof(cmp) === 'function' && cmp(node)) ||
+		    (node === cmp))
+			return node;
+
+		node = node.parentNode;
+	}
+
+	return null;
+}
+
 document.addEventListener('DOMContentLoaded', function(ev) {
 	attachEvents(window, 'click touchstart', function(ev) {
-		var opened = document.querySelector('[opened]');
-		if (opened) {
-			var node = ev.target;
-
-			while (node) {
-				if (node === opened)
-					break;
-				node = node.parentNode;
-			}
-
-			if (!node)
-				opened.removeAttribute('opened');
-		}
+		var opened = document.querySelectorAll('[opened]');
 
 		var open = ev.target.getAttribute('data-open');
 		if (typeof(open) === 'string') {
@@ -553,65 +619,103 @@ document.addEventListener('DOMContentLoaded', function(ev) {
 					window[init].call(elem, ev);
 				elem.setAttribute('opened', true);
 			}
-			ev.preventDefault();
-			return;
 		}
 
 		switch (ev.target.getAttribute('data-action')) {
 		case 'open-info':
 			openInfo(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'close-info':
 			closeInfo(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'open-movie':
 			openMovie(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'close-movie':
 			closeMovie(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'add-movie':
 			addMovie(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'play-movie':
 			addMovie(ev.target, true);
+			ev.preventDefault();
 			break;
 
 		case 'delete-movie':
 			deleteMovie(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'prev-movie':
-			if (window.currentMedia)
-				window.currentMedia = window.currentMedia.prev;
-			openMovie(ev.target);
+			prevMovie(ev.target);
+			ev.preventDefault();
 			break;
 
 		case 'next-movie':
-			if (window.currentMedia)
-				window.currentMedia = window.currentMedia.next;
-			openMovie(ev.target);
+			nextMovie(ev.target);
+			ev.preventDefault();
 			break;
 
-		default:
-			return;
+		case 'seekable-movie':
+			seekableMovie(ev.target);
+			ev.preventDefault();
+			break;
+
+		case 'start-drag':
+			ev.preventDefault();
+			break;
 		}
 
-		ev.preventDefault();
+		for (var i = 0; i < opened.length; i++) {
+			if (findParentNode(opened[i], ev.target)) {
+				continue;
+			}
+			opened[i].removeAttribute('opened');
+		}
 	});
 
-	attachEvents('[drag-handle]', 'touchmove', handleTouchMove);
-	attachEvents('[draggable]',   'touchend',  handleTouchEnd);
+	attachEvents(window, 'touchmove', function(ev) {
+		if (ev.target.matches('[data-action=start-drag]'))
+			return handleTouchMove(ev);
+	});
+
+	attachEvents(window, 'touchend', function(ev) {
+		if (findParentNode('[draggable]', ev.target))
+			return handleTouchEnd(ev);
+	});
 
 	attachEvents('audio, video', 'ended', function(ev) {
-		if (window.currentMedia && window.currentMedia.next) {
-			window.currentMedia = window.currentMedia.next;
-			openMovie(ev.target);
-		}
+		if (!window.currentMedia)
+			return;
+
+		httpcall('/next/' + window.currentMedia.serverid, function(response) {
+			var json = (response.status === 200) ? JSON.parse(response.responseText) : null;
+			window.currentMedia = json;
+			openMovie();
+		});
 	});
+
+	var plist = document.getElementById('playlist');
+
+	loadPlaylist.call(plist);
+
+	window.setInterval(function() {
+		if (document.body.classList.contains('modal') ||
+	        plist.querySelector('[opened]') ||
+	        window.dragState)
+			return;
+
+		loadPlaylist.call(plist);
+	}, 1000 * 5);
 });
